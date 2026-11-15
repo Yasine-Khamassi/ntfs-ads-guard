@@ -160,9 +160,11 @@ static void TestScoring() {
 }
 
 static void TestProtocolLayout() {
-    CHECK(sizeof(ADSG_EVENT) == 5208);
-    CHECK(offsetof(ADSG_EVENT, FileName) == 72 + ADSG_IMAGE_CHARS * sizeof(WCHAR));
-    CHECK(offsetof(ADSG_EVENT, StreamName) == 72 + (ADSG_IMAGE_CHARS + ADSG_NAME_CHARS) * sizeof(WCHAR));
+    CHECK(sizeof(ADSG_EVENT) == 5248);
+    CHECK(offsetof(ADSG_EVENT, HandleOpenTime) == 72);
+    CHECK(offsetof(ADSG_EVENT, InfoClass) == 104);
+    CHECK(offsetof(ADSG_EVENT, FileName) == 112 + ADSG_IMAGE_CHARS * sizeof(WCHAR));
+    CHECK(offsetof(ADSG_EVENT, StreamName) == 112 + (ADSG_IMAGE_CHARS + ADSG_NAME_CHARS) * sizeof(WCHAR));
 }
 
 int main() {

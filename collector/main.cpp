@@ -34,7 +34,7 @@
 
 namespace {
 
-constexpr int kSchemaVersion = 2;
+constexpr int kSchemaVersion = 3;
 
 struct Message {
     FILTER_MESSAGE_HEADER header;
@@ -107,6 +107,15 @@ std::string TimeJson(std::uint64_t t) {
     char b[48];
     std::snprintf(b, sizeof(b), "\"%04u-%02u-%02uT%02u:%02u:%02u.%07lluZ\"", st.wYear, st.wMonth, st.wDay,
                   st.wHour, st.wMinute, st.wSecond, static_cast<unsigned long long>(t % 10000000ULL));
+    return b;
+}
+
+// Milliseconds from an earlier to a later FILETIME, or null if either is
+// missing or they are out of order.
+std::string MillisJson(std::uint64_t from, std::uint64_t to) {
+    if (from == 0 || to == 0 || to < from) return "null";
+    char b[32];
+    std::snprintf(b, sizeof(b), "%.3f", static_cast<double>(to - from) / 10000.0);
     return b;
 }
 
@@ -249,6 +258,11 @@ struct EventRecord {
     std::optional<ULONG> sizeStatus, desiredAccess;
     std::optional<std::string> nameForm;
     std::optional<bool> writerDiffers;
+    std::optional<std::string> writeSource;   // handle | paging, write events only
+    std::uint64_t handleOpenTime = 0, firstWriteTime = 0, lastWriteTime = 0;
+    bool reportsCleanup = false;              // handle write: timestamp is the cleanup time
+    std::optional<std::string> setSizeClass;  // end_of_file | allocation, set_size only
+    std::optional<std::uint64_t> requestedSize;
     bool pathTruncated = false;
     Inspection inspection;
 };
@@ -301,6 +315,14 @@ void WriteEvent(Sink& sink, const EventRecord& e, const Rules& rules, bool proce
       << ",\"path_truncated\":" << (e.pathTruncated ? "true" : "false")
       << ",\"name_form\":" << JsonOrNull(e.nameForm)
       << ",\"writer_differs\":" << (e.writerDiffers ? (*e.writerDiffers ? "true" : "false") : "null")
+      << ",\"write_source\":" << JsonOrNull(e.writeSource)
+      << ",\"handle_opened_at\":" << TimeJson(e.handleOpenTime)
+      << ",\"first_write_at\":" << TimeJson(e.firstWriteTime)
+      << ",\"last_write_at\":" << TimeJson(e.lastWriteTime)
+      << ",\"handle_open_ms\":" << (e.reportsCleanup ? MillisJson(e.handleOpenTime, e.timestamp) : "null")
+      << ",\"first_write_to_cleanup_ms\":" << (e.reportsCleanup ? MillisJson(e.firstWriteTime, e.timestamp) : "null")
+      << ",\"set_size_class\":" << JsonOrNull(e.setSizeClass)
+      << ",\"requested_size\":" << NumOrNull(e.requestedSize)
       << ",\"allowlisted\":" << (f.allowlisted ? "true" : "false")
       << ",\"score\":" << f.score
       << ",\"severity\":" << Json(f.severity)
@@ -316,6 +338,7 @@ const char* OperationName(ULONG op) {
     case AdsGuardCreate: return "create";
     case AdsGuardWrite: return "write";
     case AdsGuardOverwrite: return "overwrite";
+    case AdsGuardSetSize: return "set_size";
     default: return "unknown";
     }
 }
@@ -374,8 +397,24 @@ void HandleDriverEvent(const ADSG_EVENT& e, const Rules& rules, Sink& sink) {
     if (!(e.Flags & ADSG_FLAG_SIZE_UNAVAILABLE)) rec.size = e.StreamSize;
     if (e.Operation == AdsGuardWrite) {
         rec.bytesWritten = e.BytesWritten;
-        rec.writerDiffers = (e.Flags & ADSG_FLAG_WRITER_DIFFERS) != 0;
+        rec.firstWriteTime = e.FirstWriteTime;
+        rec.lastWriteTime = e.LastWriteTime;
+        if (e.WriteSource == AdsGuardWritePaging) {
+            rec.writeSource = "paging";
+            rec.desiredAccess.reset(); // no handle is involved
+        } else {
+            rec.writeSource = "handle";
+            rec.writerDiffers = (e.Flags & ADSG_FLAG_WRITER_DIFFERS) != 0;
+            rec.handleOpenTime = e.HandleOpenTime;
+            rec.reportsCleanup = true;
+        }
+    } else if (e.Operation == AdsGuardSetSize) {
+        rec.handleOpenTime = e.HandleOpenTime;
+        rec.requestedSize = e.RequestedSize;
+        rec.setSizeClass = e.InfoClass == ADSG_INFO_END_OF_FILE ? "end_of_file"
+                         : e.InfoClass == ADSG_INFO_ALLOCATION ? "allocation" : "unknown";
     }
+    if (e.Flags & ADSG_FLAG_NAME_CACHED) rec.nameForm = "cached";
 
     if (rec.pathTruncated) {
         // A cut path may name a different file. Do not open it.

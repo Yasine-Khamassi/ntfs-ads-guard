@@ -11,7 +11,9 @@
  *   PreWrite    (<= APC_LEVEL)    looks up the handle context and records the
  *                                 first writer process.
  *   PostWrite   (<= DISPATCH)     only interlocked updates and FltReleaseContext.
- *   PreCleanup  (PASSIVE_LEVEL)   emits one write event per handle that wrote.
+ *   PreCleanup  (PASSIVE_LEVEL)   emits one write event per handle that wrote,
+ *                                 with the handle open time and the first and
+ *                                 last write times.
  *
  * Nothing in the write path queries names or sizes above PASSIVE_LEVEL, so no
  * deferred work items are needed.
@@ -24,9 +26,12 @@
 #define ADSG_SEND_TIMEOUT_MS 10
 
 typedef struct _ADSG_HANDLE_CONTEXT {
-    volatile LONG Written;        // set by PostWrite, consumed by PreCleanup
-    volatile LONG64 BytesWritten; // successful non-paging bytes on this handle
-    PEPROCESS volatile Writer;    // first writer, referenced; released in cleanup callback
+    volatile LONG Written;          // set by PostWrite, consumed by PreCleanup
+    volatile LONG64 BytesWritten;   // successful non-paging bytes on this handle
+    volatile LONG64 FirstWriteTime; // FILETIME of the first successful write, 0 if none
+    volatile LONG64 LastWriteTime;  // FILETIME of the latest successful write
+    PEPROCESS volatile Writer;      // first writer, referenced; released in cleanup callback
+    LONGLONG OpenTime;              // FILETIME when PostCreate attached the context
     ACCESS_MASK DesiredAccess;
 } ADSG_HANDLE_CONTEXT, *PADSG_HANDLE_CONTEXT;
 
@@ -125,21 +130,52 @@ static BOOLEAN CopyName(_Out_writes_(Capacity) PWCHAR Dest, SIZE_T Capacity,
     return n < Chars;
 }
 
-/* Builds and delivers one event. PASSIVE_LEVEL only. Delivery waits at most
- * ADSG_SEND_TIMEOUT_MS; anything not delivered is counted and reported in the
- * DroppedEvents field of the next delivered event. */
-static VOID SendEvent(_In_ PCFLT_RELATED_OBJECTS FltObjects,
-                      _In_ PFLT_FILE_NAME_INFORMATION Info,
-                      ULONG Flags, ULONG Operation, _In_opt_ PEPROCESS Process,
-                      ULONGLONG BytesWritten, ACCESS_MASK Access)
+/* Everything about an event except the names and the stream size. */
+typedef struct _ADSG_EVENT_INFO {
+    ULONG Operation;            // ADSG_OPERATION
+    ULONG Flags;                // ADSG_FLAG_* known before the event is built
+    ULONG WriteSource;          // ADSG_WRITE_SOURCE
+    ULONG InfoClass;            // set size only
+    PEPROCESS Process;          // optional; when NULL, FallbackPid and FallbackCreateTime are used
+    ULONG FallbackPid;
+    LONGLONG FallbackCreateTime;
+    ULONGLONG BytesWritten;
+    ACCESS_MASK Access;
+    LONGLONG HandleOpenTime;
+    LONGLONG FirstWriteTime;
+    LONGLONG LastWriteTime;
+    LONGLONG RequestedSize;
+} ADSG_EVENT_INFO, *PADSG_EVENT_INFO;
+
+static LONGLONG NowFileTime(VOID)
+{
+    LARGE_INTEGER now;
+    KeQuerySystemTimePrecise(&now); /* callable at any IRQL */
+    return now.QuadPart;
+}
+
+/* Host file length in characters for a parsed name. */
+static SIZE_T HostChars(_In_ PFLT_FILE_NAME_INFORMATION Info)
+{
+    return (Info->Name.Length - Info->Stream.Length) / sizeof(WCHAR);
+}
+
+/* Builds and delivers one event. PASSIVE_LEVEL only. Name is the full stream
+ * path and its first FileChars characters are the host file path. When
+ * FltObjects is NULL (paging writes reported from a work item) the size is
+ * not queried. Delivery waits at most ADSG_SEND_TIMEOUT_MS; anything not
+ * delivered is counted and reported in the DroppedEvents field of the next
+ * delivered event. */
+static VOID SendEvent(_In_opt_ PCFLT_RELATED_OBJECTS FltObjects,
+                      _In_ PCUNICODE_STRING Name, SIZE_T FileChars,
+                      _In_ const ADSG_EVENT_INFO *In)
 {
     PADSG_EVENT ev;
     FILE_STANDARD_INFORMATION standard = {0};
-    LARGE_INTEGER now, timeout;
+    LARGE_INTEGER timeout;
     PUNICODE_STRING image = NULL;
     ULONG returned = 0;
     LONG dropped;
-    SIZE_T fileChars;
     NTSTATUS status;
 
     PAGED_CODE();
@@ -154,17 +190,22 @@ static VOID SendEvent(_In_ PCFLT_RELATED_OBJECTS FltObjects,
     /* ExAllocatePool2 returns zeroed memory. */
     ev->Version = ADSG_PROTOCOL_VERSION;
     ev->Size = sizeof(*ev);
-    ev->Operation = Operation;
-    ev->Flags = Flags;
-    ev->BytesWritten = BytesWritten;
-    ev->DesiredAccess = Access;
-    KeQuerySystemTimePrecise(&now);
-    ev->Timestamp100ns = (ULONGLONG)now.QuadPart;
+    ev->Operation = In->Operation;
+    ev->Flags = In->Flags;
+    ev->WriteSource = In->WriteSource;
+    ev->InfoClass = In->InfoClass;
+    ev->BytesWritten = In->BytesWritten;
+    ev->DesiredAccess = In->Access;
+    ev->HandleOpenTime = (ULONGLONG)In->HandleOpenTime;
+    ev->FirstWriteTime = (ULONGLONG)In->FirstWriteTime;
+    ev->LastWriteTime = (ULONGLONG)In->LastWriteTime;
+    ev->RequestedSize = (ULONGLONG)In->RequestedSize;
+    ev->Timestamp100ns = (ULONGLONG)NowFileTime();
 
-    if (Process != NULL) {
-        ev->ProcessId = HandleToULong(PsGetProcessId(Process));
-        ev->ProcessCreateTime = (ULONGLONG)PsGetProcessCreateTimeQuadPart(Process);
-        status = SeLocateProcessImageName(Process, &image);
+    if (In->Process != NULL) {
+        ev->ProcessId = HandleToULong(PsGetProcessId(In->Process));
+        ev->ProcessCreateTime = (ULONGLONG)PsGetProcessCreateTimeQuadPart(In->Process);
+        status = SeLocateProcessImageName(In->Process, &image);
         ev->ImageQueryStatus = (ULONG)status;
         if (NT_SUCCESS(status) && image != NULL) {
             if (CopyName(ev->ProcessImage, ADSG_IMAGE_CHARS, image->Buffer, image->Length / sizeof(WCHAR)))
@@ -174,25 +215,29 @@ static VOID SendEvent(_In_ PCFLT_RELATED_OBJECTS FltObjects,
             ev->Flags |= ADSG_FLAG_IMAGE_UNAVAILABLE;
         }
     } else {
+        ev->ProcessId = In->FallbackPid;
+        ev->ProcessCreateTime = (ULONGLONG)In->FallbackCreateTime;
         ev->ImageQueryStatus = (ULONG)STATUS_NOT_FOUND;
         ev->Flags |= ADSG_FLAG_IMAGE_UNAVAILABLE;
     }
 
     /* A non-NULL top-level IRP means the file system is already inside a
      * request on this thread; a nested query could deadlock. */
-    status = IoGetTopLevelIrp() == NULL
-        ? FltQueryInformationFile(FltObjects->Instance, FltObjects->FileObject,
-              &standard, sizeof(standard), FileStandardInformation, &returned)
-        : STATUS_POSSIBLE_DEADLOCK;
+    if (FltObjects == NULL)
+        status = STATUS_NOT_SUPPORTED;
+    else if (IoGetTopLevelIrp() != NULL)
+        status = STATUS_POSSIBLE_DEADLOCK;
+    else
+        status = FltQueryInformationFile(FltObjects->Instance, FltObjects->FileObject,
+                     &standard, sizeof(standard), FileStandardInformation, &returned);
     ev->SizeQueryStatus = (ULONG)status;
     if (NT_SUCCESS(status))
         ev->StreamSize = (ULONGLONG)standard.EndOfFile.QuadPart;
     else
         ev->Flags |= ADSG_FLAG_SIZE_UNAVAILABLE;
 
-    fileChars = (Info->Name.Length - Info->Stream.Length) / sizeof(WCHAR);
-    if (CopyName(ev->StreamName, ADSG_NAME_CHARS, Info->Name.Buffer, Info->Name.Length / sizeof(WCHAR)) |
-        CopyName(ev->FileName, ADSG_NAME_CHARS, Info->Name.Buffer, fileChars))
+    if (CopyName(ev->StreamName, ADSG_NAME_CHARS, Name->Buffer, Name->Length / sizeof(WCHAR)) |
+        CopyName(ev->FileName, ADSG_NAME_CHARS, Name->Buffer, FileChars))
         ev->Flags |= ADSG_FLAG_PATH_TRUNCATED;
 
     dropped = InterlockedExchange(&g.DroppedEvents, 0);
@@ -220,6 +265,7 @@ static VOID AttachHandleContext(_In_ PCFLT_RELATED_OBJECTS FltObjects, ACCESS_MA
     }
     RtlZeroMemory(ctx, sizeof(*ctx));
     ctx->DesiredAccess = Access;
+    ctx->OpenTime = NowFileTime();
     (VOID)FltSetStreamHandleContext(FltObjects->Instance, FltObjects->FileObject,
                                     FLT_SET_CONTEXT_KEEP_IF_EXISTS, ctx, NULL);
     FltReleaseContext(ctx);
@@ -250,8 +296,8 @@ static FLT_POSTOP_CALLBACK_STATUS FLTAPI PostCreate(_Inout_ PFLT_CALLBACK_DATA D
     _In_ FLT_POST_OPERATION_FLAGS Flags)
 {
     PFLT_FILE_NAME_INFORMATION info = NULL;
+    ADSG_EVENT_INFO ev;
     ULONG nameFlags = 0;
-    ULONG operation;
     ACCESS_MASK access;
 
     UNREFERENCED_PARAMETER(CompletionContext);
@@ -272,12 +318,16 @@ static FLT_POSTOP_CALLBACK_STATUS FLTAPI PostCreate(_Inout_ PFLT_CALLBACK_DATA D
     if (FlagOn(access, FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL | MAXIMUM_ALLOWED))
         AttachHandleContext(FltObjects, access);
 
+    RtlZeroMemory(&ev, sizeof(ev));
     switch (Data->IoStatus.Information) {
-    case FILE_OPENED:      operation = AdsGuardOpen; break;
-    case FILE_CREATED:     operation = AdsGuardCreate; break;
-    default:               operation = AdsGuardOverwrite; break; /* FILE_OVERWRITTEN, FILE_SUPERSEDED */
+    case FILE_OPENED:      ev.Operation = AdsGuardOpen; break;
+    case FILE_CREATED:     ev.Operation = AdsGuardCreate; break;
+    default:               ev.Operation = AdsGuardOverwrite; break; /* FILE_OVERWRITTEN, FILE_SUPERSEDED */
     }
-    SendEvent(FltObjects, info, nameFlags, operation, FltGetRequestorProcess(Data), 0, access);
+    ev.Flags = nameFlags;
+    ev.Process = FltGetRequestorProcess(Data);
+    ev.Access = access;
+    SendEvent(FltObjects, &info->Name, HostChars(info), &ev);
     FltReleaseFileNameInformation(info);
     return FLT_POSTOP_FINISHED_PROCESSING;
 }
@@ -317,7 +367,10 @@ static FLT_POSTOP_CALLBACK_STATUS FLTAPI PostWrite(_Inout_ PFLT_CALLBACK_DATA Da
      * holds its own context reference, so this release is never the last. */
     if (!FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING) &&
         NT_SUCCESS(Data->IoStatus.Status) && Data->IoStatus.Information > 0) {
+        LONGLONG now = NowFileTime();
         InterlockedAdd64(&ctx->BytesWritten, (LONG64)Data->IoStatus.Information);
+        InterlockedCompareExchange64(&ctx->FirstWriteTime, now, 0);
+        InterlockedExchange64(&ctx->LastWriteTime, now);
         InterlockedExchange(&ctx->Written, 1);
     }
     FltReleaseContext(ctx);
@@ -329,6 +382,7 @@ static FLT_PREOP_CALLBACK_STATUS FLTAPI PreCleanup(_Inout_ PFLT_CALLBACK_DATA Da
 {
     PADSG_HANDLE_CONTEXT ctx = NULL;
     PFLT_FILE_NAME_INFORMATION info = NULL;
+    ADSG_EVENT_INFO ev;
     ULONG nameFlags = 0;
 
     *CompletionContext = NULL;
@@ -336,11 +390,20 @@ static FLT_PREOP_CALLBACK_STATUS FLTAPI PreCleanup(_Inout_ PFLT_CALLBACK_DATA Da
                                               (PFLT_CONTEXT *)&ctx)))
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     if (InterlockedExchange(&ctx->Written, 0) != 0) {
+        RtlZeroMemory(&ev, sizeof(ev));
+        ev.Operation = AdsGuardWrite;
+        ev.WriteSource = AdsGuardWriteHandle;
+        ev.Process = ctx->Writer;
+        ev.Access = ctx->DesiredAccess;
+        ev.HandleOpenTime = ctx->OpenTime;
+        ev.BytesWritten = (ULONGLONG)InterlockedExchange64(&ctx->BytesWritten, 0);
+        ev.FirstWriteTime = InterlockedExchange64(&ctx->FirstWriteTime, 0);
+        ev.LastWriteTime = InterlockedExchange64(&ctx->LastWriteTime, 0);
         if (FltGetRequestorProcess(Data) != ctx->Writer)
             nameFlags |= ADSG_FLAG_WRITER_DIFFERS;
         if (NT_SUCCESS(GetNameInfo(Data, &info, &nameFlags))) {
-            SendEvent(FltObjects, info, nameFlags, AdsGuardWrite, ctx->Writer,
-                      (ULONGLONG)InterlockedExchange64(&ctx->BytesWritten, 0), ctx->DesiredAccess);
+            ev.Flags = nameFlags;
+            SendEvent(FltObjects, &info->Name, HostChars(info), &ev);
             FltReleaseFileNameInformation(info);
         } else if (g.ClientPort != NULL) {
             InterlockedIncrement(&g.DroppedEvents);
