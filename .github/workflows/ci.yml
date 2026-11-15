@@ -11,18 +11,26 @@ jobs:
           persist-credentials: false
       - run: cmake -S collector -B build/collector -A x64
       - run: cmake --build build/collector --config Release
+      - run: ctest --test-dir build/collector -C Release --output-on-failure
       - run: pwsh -File collector/tests/config_validation.ps1 -Exe build/collector/Release/ads-guard-collector.exe -ValidConfig config/rules.json
+      - run: pwsh -File collector/tests/scan_test.ps1 -Exe build/collector/Release/ads-guard-collector.exe -Config config/rules.json
 
   driver:
-    # Compiles and packages the minifilter with the runner's WDK.
-    # This checks that the code builds; it does not load or exercise it.
-    # The WDK comes from NuGet (driver/packages.config), as in Microsoft's
-    # driver samples CI.
+    # Compiles and packages the minifilter against the WDK NuGet packages
+    # (driver/packages.config), as Microsoft's driver samples CI does.
+    # This proves the code builds. It does not load or exercise the driver.
     runs-on: windows-2025-vs2026
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - run: nuget restore driver/packages.config -PackagesDirectory driver/packages
-      - uses: microsoft/setup-msbuild@v2
-      - run: msbuild driver/AdsGuard.vcxproj /p:Configuration=Release /p:Platform=x64 /m /nologo
+      - name: Build AdsGuard.sys
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          nuget restore driver/packages.config -PackagesDirectory driver/packages
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          Import-Module (Join-Path $vs 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+          msbuild driver/AdsGuard.vcxproj -p:Configuration=Release -p:Platform=x64 -nologo
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
