@@ -1,0 +1,14 @@
+{
+  "allow_stream_suffixes": [":Zone.Identifier"],
+  "allow_process_paths": [],
+  "entropy_threshold": 7.0,
+  "stream_size_limit_bytes": 16777216,
+  "thresholds": { "low": 20, "medium": 40, "high": 70 },
+  "weights": {
+    "named_stream": 10,
+    "pe_header": 50,
+    "high_entropy": 25,
+    "executable_extension": 20,
+    "system_binary_host": 15
+  }
+}

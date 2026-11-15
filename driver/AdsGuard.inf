@@ -1,0 +1,42 @@
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = "ActivityMonitor"
+ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}
+Provider    = %Provider%
+DriverVer   = 11/16/2026,1.0.0.0
+CatalogFile = AdsGuard.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+AdsGuard.DriverFiles = 12
+
+[DefaultInstall.NTamd64]
+OptionDesc = %ServiceDesc%
+CopyFiles = AdsGuard.DriverFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService = AdsGuard,,AdsGuard.Service
+
+[AdsGuard.Service]
+DisplayName    = %ServiceDesc%
+Description    = %ServiceDesc%
+ServiceBinary  = %12%\AdsGuard.sys
+ServiceType    = 2
+StartType      = 3
+ErrorControl   = 1
+LoadOrderGroup = "FSFilter Activity Monitor"
+AddReg         = AdsGuard.Instances
+
+[AdsGuard.Instances]
+HKR,"Instances","DefaultInstance",0x00000000,%InstanceName%
+HKR,"Instances\%InstanceName%","Altitude",0x00000000,"385250"
+HKR,"Instances\%InstanceName%","Flags",0x00010001,0
+
+[AdsGuard.DriverFiles]
+AdsGuard.sys
+
+[Strings]
+Provider = "NTFS ADS Guard"
+ServiceDesc = "NTFS ADS Guard Minifilter"
+InstanceName = "AdsGuard Instance"

@@ -1,0 +1,8 @@
+/build/
+*.user
+*.suo
+*.sys
+*.pdb
+*.obj
+*.ilk
+events.jsonl
