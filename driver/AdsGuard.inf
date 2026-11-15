@@ -42,9 +42,11 @@ ErrorControl   = 1
 LoadOrderGroup = "FSFilter Activity Monitor"
 AddReg         = AdsGuard.Instances
 
-; Activity Monitor altitudes are 360000 to 389999. 385250 is a placeholder
-; for lab use only. Request an assigned altitude from Microsoft before any
-; deployment outside a test VM.
+; DEVELOPMENT-ONLY ALTITUDE. FSFilter Activity Monitor is 360000 to 389999.
+; 389992 is not in Microsoft's allocated altitude list (October 2026 update),
+; which has no Activity Monitor entries above 389560.5. It is not assigned to
+; this project and may be given to someone else at any time. Use it in test
+; VMs only. See docs/ALTITUDE.md before shipping anything.
 [AdsGuard.Instances]
 HKR,"Parameters\Instances","DefaultInstance",0x00000000,%InstanceName%
 HKR,"Parameters\Instances\"%InstanceName%,"Altitude",0x00000000,%Altitude%
@@ -61,4 +63,4 @@ Provider     = "NTFS ADS Guard"
 DiskName     = "NTFS ADS Guard Installation Disk"
 ServiceDesc  = "NTFS ADS Guard Minifilter"
 InstanceName = "AdsGuard Instance"
-Altitude     = "385250"
+Altitude     = "389992" ; development only, see docs/ALTITUDE.md

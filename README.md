@@ -2,7 +2,7 @@
 
 A Windows minifilter and a user-mode collector that record activity on NTFS alternate data streams (named `$DATA` streams) as JSON Lines. Each record says which process touched which stream, how big it is, what the first bytes look like (entropy, PE header, SHA-256), and a configurable score.
 
-This is a lab project for detection engineering. It is not signed, has no assigned altitude, and has not been load tested. Run the driver only in a disposable VM.
+This is a lab project for detection engineering. It is not signed, uses a development-only altitude, and has not been load tested. Run the driver only in a disposable VM.
 
 ## Layout
 
@@ -87,7 +87,7 @@ The harness creates a short text stream, a `Zone.Identifier` stream, and a non-r
    ```
 5. Remove it afterwards: stop the collector, `fltmc unload AdsGuard`, run `RUNDLL32.EXE SETUPAPI.DLL,InstallHinfSection DefaultUninstall 132 .\AdsGuard.inf`, and restore the test-signing setting.
 
-The altitude in the INF, 385250, is a placeholder inside the Activity Monitor range (360000 to 389999). Request an assigned altitude from Microsoft before using it anywhere else.
+The altitude in the INF, 389992, is a **development-only** value in the Activity Monitor range (360000 to 389999). It is not assigned to this project. See [docs/ALTITUDE.md](docs/ALTITUDE.md) for why it was picked and how to request a permanent one.
 
 ## Output
 
