@@ -16,10 +16,13 @@ jobs:
   driver:
     # Compiles and packages the minifilter with the runner's WDK.
     # This checks that the code builds; it does not load or exercise it.
-    runs-on: windows-2022
+    # The WDK comes from NuGet (driver/packages.config), as in Microsoft's
+    # driver samples CI.
+    runs-on: windows-2025-vs2026
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - run: nuget restore driver/packages.config -PackagesDirectory driver/packages
       - uses: microsoft/setup-msbuild@v2
       - run: msbuild driver/AdsGuard.vcxproj /p:Configuration=Release /p:Platform=x64 /m /nologo

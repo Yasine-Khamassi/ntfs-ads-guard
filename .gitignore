@@ -1,8 +1,15 @@
 /build/
+/driver/packages/
+/driver/x64/
+/driver/AdsGuard/
 *.user
 *.suo
+.vs/
 *.sys
+*.cat
 *.pdb
 *.obj
 *.ilk
+*.exe
+*.tlog
 events.jsonl

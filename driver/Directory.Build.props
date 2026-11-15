@@ -1,0 +1,14 @@
+<Project>
+  <!-- Optional: when the WDK NuGet packages are restored into driver/packages
+       (as CI does), build against them. Without them, the installed WDK is used. -->
+  <PropertyGroup>
+    <AdsgWdkNuGet>10.0.28000.2526</AdsgWdkNuGet>
+    <AdsgPackages>$(MSBuildThisFileDirectory)packages</AdsgPackages>
+  </PropertyGroup>
+  <Import Project="$(AdsgPackages)/Microsoft.Windows.WDK.x64.$(AdsgWdkNuGet)/build/native/Microsoft.Windows.WDK.x64.props"
+          Condition="Exists('$(AdsgPackages)/Microsoft.Windows.WDK.x64.$(AdsgWdkNuGet)/build/native/Microsoft.Windows.WDK.x64.props') and '$(Platform)' == 'x64'" />
+  <Import Project="$(AdsgPackages)/Microsoft.Windows.SDK.CPP.x64.$(AdsgWdkNuGet)/build/native/Microsoft.Windows.SDK.cpp.x64.props"
+          Condition="Exists('$(AdsgPackages)/Microsoft.Windows.SDK.CPP.x64.$(AdsgWdkNuGet)/build/native/Microsoft.Windows.SDK.cpp.x64.props') and '$(Platform)' == 'x64'" />
+  <Import Project="$(AdsgPackages)/Microsoft.Windows.SDK.CPP.$(AdsgWdkNuGet)/build/native/Microsoft.Windows.SDK.cpp.props"
+          Condition="Exists('$(AdsgPackages)/Microsoft.Windows.SDK.CPP.$(AdsgWdkNuGet)/build/native/Microsoft.Windows.SDK.cpp.props')" />
+</Project>
