@@ -1,4 +1,4 @@
-name: Collector build
+name: CI
 on: [push, pull_request]
 permissions:
   contents: read
@@ -12,3 +12,14 @@ jobs:
       - run: cmake -S collector -B build/collector -A x64
       - run: cmake --build build/collector --config Release
       - run: pwsh -File collector/tests/config_validation.ps1 -Exe build/collector/Release/ads-guard-collector.exe -ValidConfig config/rules.json
+
+  driver:
+    # Compiles and packages the minifilter with the runner's WDK.
+    # This checks that the code builds; it does not load or exercise it.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: microsoft/setup-msbuild@v2
+      - run: msbuild driver/AdsGuard.vcxproj /p:Configuration=Release /p:Platform=x64 /m /nologo
