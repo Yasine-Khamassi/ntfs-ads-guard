@@ -11,6 +11,10 @@
  *   PreWrite    (<= APC_LEVEL)    looks up the handle context and records the
  *                                 first writer process.
  *   PostWrite   (<= DISPATCH)     only interlocked updates and FltReleaseContext.
+ *   PreSetInfo  (PASSIVE_LEVEL)   end of file and allocation changes on
+ *                                 monitored handles; synchronized so that
+ *   PostSetInfo (<= APC_LEVEL)    the post callback runs in the caller's
+ *                                 thread and emits set_size at PASSIVE_LEVEL.
  *   PreCleanup  (PASSIVE_LEVEL)   emits one write event per handle that wrote,
  *                                 with the handle open time and the first and
  *                                 last write times.
@@ -377,6 +381,82 @@ static FLT_POSTOP_CALLBACK_STATUS FLTAPI PostWrite(_Inout_ PFLT_CALLBACK_DATA Da
     return FLT_POSTOP_FINISHED_PROCESSING;
 }
 
+/* SetEndOfFile (truncation or extension) and allocation size changes
+ * through NtSetInformationFile. Only handles that carry a
+ * context (named stream opened for write) are considered. The lazy writer's
+ * AdvanceOnly end-of-file updates and paging I/O are internal bookkeeping and
+ * are skipped. */
+static FLT_PREOP_CALLBACK_STATUS FLTAPI PreSetInformation(_Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects, _Outptr_result_maybenull_ PVOID *CompletionContext)
+{
+    PADSG_HANDLE_CONTEXT ctx = NULL;
+    FILE_INFORMATION_CLASS cls = Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
+
+    *CompletionContext = NULL;
+    if (cls != FileEndOfFileInformation && cls != FileAllocationInformation)
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (cls == FileEndOfFileInformation && Data->Iopb->Parameters.SetFileInformation.AdvanceOnly)
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (Data->Iopb->Parameters.SetFileInformation.Length < sizeof(LARGE_INTEGER) ||
+        g.ClientPort == NULL || IsCollector(Data))
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!NT_SUCCESS(FltGetStreamHandleContext(FltObjects->Instance, FltObjects->FileObject,
+                                              (PFLT_CONTEXT *)&ctx)))
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    *CompletionContext = ctx; /* reference released in PostSetInformation */
+    /* Synchronize: the post callback runs in this thread, after the file
+     * system completed the request, at the IRQL of this callback. */
+    return FLT_PREOP_SYNCHRONIZE;
+}
+
+static FLT_POSTOP_CALLBACK_STATUS FLTAPI PostSetInformation(_Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects, _In_opt_ PVOID CompletionContext,
+    _In_ FLT_POST_OPERATION_FLAGS Flags)
+{
+    PADSG_HANDLE_CONTEXT ctx = (PADSG_HANDLE_CONTEXT)CompletionContext;
+    PFLT_FILE_NAME_INFORMATION info = NULL;
+    ADSG_EVENT_INFO ev;
+    ULONG nameFlags = 0;
+
+    if (ctx == NULL)
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    if (FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING) || !NT_SUCCESS(Data->IoStatus.Status)) {
+        FltReleaseContext(ctx);
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+    /* Name and size queries and FltSendMessage need PASSIVE_LEVEL. A
+     * synchronized post callback runs at the pre callback's IRQL, which is
+     * PASSIVE_LEVEL for requests from user mode; anything else is counted. */
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        if (g.ClientPort != NULL)
+            InterlockedIncrement(&g.DroppedEvents);
+        FltReleaseContext(ctx);
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
+
+    RtlZeroMemory(&ev, sizeof(ev));
+    ev.Operation = AdsGuardSetSize;
+    ev.InfoClass = (ULONG)Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
+    /* FILE_END_OF_FILE_INFORMATION and FILE_ALLOCATION_INFORMATION are both
+     * a single LARGE_INTEGER; the length was checked in the pre callback. */
+    ev.RequestedSize = ((PLARGE_INTEGER)Data->Iopb->Parameters.SetFileInformation.InfoBuffer)->QuadPart;
+    ev.Process = FltGetRequestorProcess(Data);
+    ev.Access = ctx->DesiredAccess;
+    ev.HandleOpenTime = ctx->OpenTime;
+    FltReleaseContext(ctx);
+
+    if (NT_SUCCESS(GetNameInfo(Data, &info, &nameFlags))) {
+        if (IsNamedDataStream(&info->Stream)) {
+            ev.Flags = nameFlags;
+            SendEvent(FltObjects, &info->Name, HostChars(info), &ev);
+        }
+        FltReleaseFileNameInformation(info);
+    } else if (g.ClientPort != NULL) {
+        InterlockedIncrement(&g.DroppedEvents);
+    }
+    return FLT_POSTOP_FINISHED_PROCESSING;
+}
+
 static FLT_PREOP_CALLBACK_STATUS FLTAPI PreCleanup(_Inout_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects, _Outptr_result_maybenull_ PVOID *CompletionContext)
 {
@@ -475,6 +555,7 @@ static const FLT_CONTEXT_REGISTRATION Contexts[] = {
 static const FLT_OPERATION_REGISTRATION Callbacks[] = {
     { IRP_MJ_CREATE, 0, PreCreate, PostCreate },
     { IRP_MJ_WRITE, FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO, PreWrite, PostWrite },
+    { IRP_MJ_SET_INFORMATION, FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO, PreSetInformation, PostSetInformation },
     { IRP_MJ_CLEANUP, 0, PreCleanup, NULL },
     { IRP_MJ_OPERATION_END }
 };
