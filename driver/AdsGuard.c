@@ -122,6 +122,15 @@ static BOOLEAN MayTargetNamedStream(_In_ PFLT_CALLBACK_DATA Data, _In_ PFILE_OBJ
     return FALSE;
 }
 
+/* Functions that only run at PASSIVE_LEVEL live in the pageable section. */
+static NTSTATUS GetNameInfo(_In_ PFLT_CALLBACK_DATA Data,
+                            _Outptr_ PFLT_FILE_NAME_INFORMATION *Info,
+                            _Inout_ PULONG Flags);
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(INIT, DriverEntry)
+#pragma alloc_text(PAGE, GetNameInfo)
+#endif
+
 static NTSTATUS GetNameInfo(_In_ PFLT_CALLBACK_DATA Data,
                             _Outptr_ PFLT_FILE_NAME_INFORMATION *Info,
                             _Inout_ PULONG Flags)
@@ -188,6 +197,21 @@ static SIZE_T HostChars(_In_ PFLT_FILE_NAME_INFORMATION Info)
 {
     return (Info->Name.Length - Info->Stream.Length) / sizeof(WCHAR);
 }
+
+static VOID SendEvent(_In_opt_ PCFLT_RELATED_OBJECTS FltObjects,
+                      _In_ PCUNICODE_STRING Name, SIZE_T FileChars,
+                      _In_ const ADSG_EVENT_INFO *In);
+static VOID TrackStreamForPaging(_In_ PCFLT_RELATED_OBJECTS FltObjects,
+                                 _In_ PFLT_FILE_NAME_INFORMATION Info, ULONG NameFlags,
+                                 _In_opt_ PEPROCESS Process);
+static VOID FLTAPI PagingWork(_In_ PFLT_GENERIC_WORKITEM WorkItem, _In_ PVOID FltObject, _In_opt_ PVOID Context);
+static NTSTATUS FLTAPI FilterUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags);
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, SendEvent)
+#pragma alloc_text(PAGE, TrackStreamForPaging)
+#pragma alloc_text(PAGE, PagingWork)
+#pragma alloc_text(PAGE, FilterUnload)
+#endif
 
 /* Builds and delivers one event. PASSIVE_LEVEL only. Name is the full stream
  * path and its first FileChars characters are the host file path. When
