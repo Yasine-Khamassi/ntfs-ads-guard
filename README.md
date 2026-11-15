@@ -58,7 +58,7 @@ nuget restore driver/packages.config -PackagesDirectory driver/packages
 msbuild driver/AdsGuard.vcxproj -p:Configuration=Release -p:Platform=x64
 ```
 
-The driver uses `ExAllocatePool2`, so it needs Windows 10 version 2004 or later.
+The build runs InfVerif, compiles at `/W4 /WX`, and writes a test-signed package (`AdsGuard.sys`, `AdsGuard.inf`, `adsguard.cat`) to `driver/x64/Release/AdsGuard/`. The driver uses `ExAllocatePool2`, so it needs Windows 10 version 2004 or later.
 
 ## Try it without the driver
 
@@ -74,7 +74,7 @@ The harness creates a short text stream, a `Zone.Identifier` stream, and a non-r
 ## Run with the driver (test VM only)
 
 1. Enable test signing (`bcdedit /set testsigning on`) and reboot. Note the previous setting so you can restore it.
-2. Copy `AdsGuard.sys`, `AdsGuard.inf` and the catalog to the VM.
+2. Copy the `driver/x64/Release/AdsGuard/` package folder to the VM.
 3. Install and load from an elevated prompt:
    ```powershell
    RUNDLL32.EXE SETUPAPI.DLL,InstallHinfSection DefaultInstall 132 .\AdsGuard.inf
