@@ -17,7 +17,7 @@ static std::vector<unsigned char> MzWithPeAt(std::uint32_t offset, std::size_t s
     std::vector<unsigned char> b(size, 0);
     b[0] = 'M'; b[1] = 'Z';
     std::memcpy(b.data() + 0x3c, &offset, sizeof(offset));
-    if (offset + 4 <= size) { b[offset] = 'P'; b[offset + 1] = 'E'; }
+    if (static_cast<std::uint64_t>(offset) + 4 <= size) { b[offset] = 'P'; b[offset + 1] = 'E'; }
     return b;
 }
 

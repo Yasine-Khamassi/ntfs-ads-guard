@@ -25,7 +25,7 @@ AddService = AdsGuard,,AdsGuard.Service
 
 [DefaultUninstall.NTamd64]
 LegacyUninstall = 1
-DelFiles        = AdsGuard.DriverFiles
+DelFiles        = AdsGuard.DeleteDriverFiles
 
 [DefaultUninstall.NTamd64.Services]
 DelService = AdsGuard,0x200
@@ -45,9 +45,9 @@ AddReg         = AdsGuard.Instances
 ; for lab use only. Request an assigned altitude from Microsoft before any
 ; deployment outside a test VM.
 [AdsGuard.Instances]
-HKR,"Instances","DefaultInstance",0x00000000,%InstanceName%
-HKR,"Instances\"%InstanceName%,"Altitude",0x00000000,%Altitude%
-HKR,"Instances\"%InstanceName%,"Flags",0x00010001,0
+HKR,"Parameters\Instances","DefaultInstance",0x00000000,%InstanceName%
+HKR,"Parameters\Instances\"%InstanceName%,"Altitude",0x00000000,%Altitude%
+HKR,"Parameters\Instances\"%InstanceName%,"Flags",0x00010001,0
 
 [AdsGuard.DriverFiles]
 AdsGuard.sys
