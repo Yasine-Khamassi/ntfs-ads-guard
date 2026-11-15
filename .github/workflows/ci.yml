@@ -14,6 +14,14 @@ jobs:
       - run: ctest --test-dir build/collector -C Release --output-on-failure
       - run: pwsh -File collector/tests/config_validation.ps1 -Exe build/collector/Release/ads-guard-collector.exe -ValidConfig config/rules.json
       - run: pwsh -File collector/tests/scan_test.ps1 -Exe build/collector/Release/ads-guard-collector.exe -Config config/rules.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ads-guard-collector
+          path: |
+            build/collector/Release/ads-guard-collector.exe
+            config/rules.json
+          if-no-files-found: error
+          retention-days: 30
 
   driver:
     # Compiles and packages the minifilter against the WDK NuGet packages
@@ -34,6 +42,16 @@ jobs:
           Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
           msbuild driver/AdsGuard.vcxproj -p:Configuration=Release -p:Platform=x64 -nologo
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload the test-signed package
+        # For a test VM only: the signature is a WDK test certificate.
+        uses: actions/upload-artifact@v4
+        with:
+          name: adsguard-package
+          path: |
+            driver/x64/Release/AdsGuard/
+            tools/verifier.ps1
+          if-no-files-found: error
+          retention-days: 30
       - name: Code Analysis (/analyze, warnings are errors)
         # Static Driver Verifier is not shipped in WDKs after build 26017, so
         # it cannot run against the WDK used here. This is the MSBuild
