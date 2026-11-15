@@ -1,8 +1,12 @@
 {
-  "allow_stream_suffixes": [":Zone.Identifier"],
+  "allow_stream_names": ["Zone.Identifier", "SmartScreen"],
   "allow_process_paths": [],
+  "executable_extensions": [".exe", ".dll", ".scr", ".sys", ".com", ".cpl", ".ps1", ".vbs", ".js", ".hta", ".bat", ".cmd"],
+  "system_host_prefixes": ["C:\\Windows\\"],
   "entropy_threshold": 7.0,
+  "entropy_min_bytes": 512,
   "stream_size_limit_bytes": 16777216,
+  "queue_capacity": 1024,
   "thresholds": { "low": 20, "medium": 40, "high": 70 },
   "weights": {
     "named_stream": 10,
