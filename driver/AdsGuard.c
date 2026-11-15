@@ -134,7 +134,7 @@ static VOID SendEvent(_In_ PCFLT_RELATED_OBJECTS FltObjects,
                       ULONGLONG BytesWritten, ACCESS_MASK Access)
 {
     PADSG_EVENT ev;
-    FILE_STANDARD_INFORMATION standard;
+    FILE_STANDARD_INFORMATION standard = {0};
     LARGE_INTEGER now, timeout;
     PUNICODE_STRING image = NULL;
     ULONG returned = 0;
