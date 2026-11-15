@@ -50,6 +50,27 @@ try {
     Assert ($pe.reasons -contains 'high_entropy') 'high_entropy reason'
     Assert ($pe.severity -eq 'high') "synthetic.exe severity high, got $($pe.severity)"
 
+    # Parent hashing: only scored events hash the host file's default stream.
+    $parentHash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+    Assert ($pe.parent_sha256_status -eq 'complete') "parent hashed for a scored event, got $($pe.parent_sha256_status)"
+    Assert ($pe.parent_sha256 -eq $parentHash) "parent_sha256 matches ($($pe.parent_sha256) vs $parentHash)"
+    Assert ($pe.parent_size -eq (Get-Item -LiteralPath $file).Length) 'parent_size is the default stream length'
+    Assert ($review.parent_sha256_status -eq 'not_scored') "review.txt below the low threshold, got $($review.parent_sha256_status)"
+    Assert ($null -eq $review.parent_sha256) 'no parent hash for an unscored event'
+    Assert ($zone.parent_sha256_status -eq 'not_scored') 'no parent hash for an allow-listed stream'
+
+    # Over the limit: the same scan with parent_hash_max_bytes below the host size.
+    $smallConfig = Join-Path $temp 'small-parent-limit.json'
+    $o = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    $o.parent_hash_max_bytes = 4
+    [System.IO.File]::WriteAllText($smallConfig, ($o | ConvertTo-Json -Depth 5), [System.Text.UTF8Encoding]::new($false))
+    $limited = Join-Path $temp 'limited.jsonl'
+    & $exePath --scan $file --config $smallConfig --output $limited
+    if ($LASTEXITCODE -ne 0) { throw "Limited scan returned exit code $LASTEXITCODE" }
+    $limitedPe = @(Get-Content -LiteralPath $limited | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object stream_name -eq 'synthetic.exe')[0]
+    Assert ($limitedPe.parent_sha256_status -eq 'skipped_size_limit') "parent over the limit is skipped, got $($limitedPe.parent_sha256_status)"
+    Assert ($null -eq $limitedPe.parent_sha256) 'no hash when over the limit'
+
     Write-Host "Scan test passed ($($records.Count) records)."
 }
 finally {

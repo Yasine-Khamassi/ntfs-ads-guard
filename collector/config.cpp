@@ -72,6 +72,7 @@ Rules LoadRules(const std::wstring& path) {
     const auto& o = Object(root, "root");
     CheckKeys(o, {"allow_stream_names", "allow_process_paths", "executable_extensions", "system_host_prefixes",
                   "entropy_threshold", "entropy_min_bytes", "stream_size_limit_bytes", "queue_capacity",
+                  "parent_hash_max_bytes",
                   "thresholds", "weights"}, "root");
     Rules r;
     // Stream names are the bare name, e.g. "Zone.Identifier": no colon, no path.
@@ -84,6 +85,7 @@ Rules LoadRules(const std::wstring& path) {
     r.entropyThreshold = Number(Member(o, "entropy_threshold"), "entropy_threshold", 0.0, 8.0);
     r.entropyMinBytes = static_cast<std::uint64_t>(Integer(Member(o, "entropy_min_bytes"), "entropy_min_bytes", 1, 1024LL * 1024 * 1024));
     r.sizeLimit = static_cast<std::uint64_t>(Integer(Member(o, "stream_size_limit_bytes"), "stream_size_limit_bytes", 1, 1024LL * 1024 * 1024));
+    r.parentHashLimit = static_cast<std::uint64_t>(Integer(Member(o, "parent_hash_max_bytes"), "parent_hash_max_bytes", 0, 1024LL * 1024 * 1024));
     r.queueCapacity = static_cast<std::size_t>(Integer(Member(o, "queue_capacity"), "queue_capacity", 1, 65536));
     const auto& thresholds = Object(Member(o, "thresholds"), "thresholds");
     CheckKeys(thresholds, {"low", "medium", "high"}, "thresholds");

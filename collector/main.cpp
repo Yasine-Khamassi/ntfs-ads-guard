@@ -244,6 +244,71 @@ Inspection Inspect(const std::wstring& openPath, const Rules& rules) {
     return r;
 }
 
+// Hash of the host file's default stream, taken only for scored events.
+struct ParentHash {
+    std::string status = "not_scored"; // complete | not_scored | disabled | not_a_file | skipped_size_limit
+                                       // | skipped_path_truncated | unavailable | error
+    DWORD error = 0;
+    std::optional<std::uint64_t> size;
+    std::optional<std::string> sha256;
+};
+
+ParentHash HashParent(const std::wstring& openPath, std::uint64_t limit) {
+    ParentHash r;
+    if (limit == 0) { r.status = "disabled"; return r; }
+    HANDLE h = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        // Backup semantics only so that a directory host opens and can be
+        // recognised; no privilege is requested.
+        h = CreateFileW(openPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (h != INVALID_HANDLE_VALUE) break;
+        r.error = GetLastError();
+        if (r.error != ERROR_SHARING_VIOLATION) break;
+        Sleep(20);
+    }
+    if (h == INVALID_HANDLE_VALUE) { r.status = "unavailable"; return r; }
+    r.error = ERROR_SUCCESS;
+    BY_HANDLE_FILE_INFORMATION info{};
+    LARGE_INTEGER size{};
+    if (!GetFileInformationByHandle(h, &info) || !GetFileSizeEx(h, &size)) {
+        r.error = GetLastError();
+        CloseHandle(h);
+        r.status = "unavailable";
+        return r;
+    }
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        CloseHandle(h);
+        r.status = "not_a_file";
+        return r;
+    }
+    r.size = static_cast<std::uint64_t>(size.QuadPart);
+    if (*r.size > limit) {
+        CloseHandle(h);
+        r.status = "skipped_size_limit";
+        return r;
+    }
+    ContentAccumulator acc;
+    std::vector<unsigned char> buf(64 * 1024);
+    bool eof = false;
+    while (acc.Bytes() <= limit) {
+        DWORD got = 0;
+        if (!ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr)) { r.error = GetLastError(); break; }
+        if (got == 0) { eof = true; break; }
+        acc.Add(buf.data(), got);
+    }
+    CloseHandle(h);
+    if (!eof) {
+        // Either a read error or the file grew past the limit while reading.
+        r.status = r.error ? "unavailable" : "skipped_size_limit";
+        return r;
+    }
+    r.size = acc.Bytes();
+    r.sha256 = acc.FinishSha256();
+    r.status = r.sha256 ? "complete" : "error";
+    return r;
+}
+
 // ---- event records ---------------------------------------------------------
 
 struct EventRecord {
@@ -265,6 +330,7 @@ struct EventRecord {
     std::optional<std::uint64_t> requestedSize;
     bool pathTruncated = false;
     Inspection inspection;
+    std::wstring parentOpenPath; // host file path to open for hashing, empty if it must not be opened
 };
 
 const char* PeJson(PeResult pe) {
@@ -283,6 +349,12 @@ void WriteEvent(Sink& sink, const EventRecord& e, const Rules& rules, bool proce
     in.processAvailable = !e.process.empty();
     in.processApplicable = processApplicable;
     Findings f = Score(in, rules);
+
+    ParentHash parent;
+    if (f.severity != "informational") {
+        if (e.parentOpenPath.empty()) parent.status = "skipped_path_truncated";
+        else parent = HashParent(e.parentOpenPath, rules.parentHashLimit);
+    }
 
     std::string entropy = "null";
     if (e.inspection.entropy) {
@@ -323,6 +395,10 @@ void WriteEvent(Sink& sink, const EventRecord& e, const Rules& rules, bool proce
       << ",\"first_write_to_cleanup_ms\":" << (e.reportsCleanup ? MillisJson(e.firstWriteTime, e.timestamp) : "null")
       << ",\"set_size_class\":" << JsonOrNull(e.setSizeClass)
       << ",\"requested_size\":" << NumOrNull(e.requestedSize)
+      << ",\"parent_size\":" << NumOrNull(parent.size)
+      << ",\"parent_sha256\":" << JsonOrNull(parent.sha256)
+      << ",\"parent_sha256_status\":" << Json(parent.status)
+      << ",\"parent_error\":" << parent.error
       << ",\"allowlisted\":" << (f.allowlisted ? "true" : "false")
       << ",\"score\":" << f.score
       << ",\"severity\":" << Json(f.severity)
@@ -422,6 +498,7 @@ void HandleDriverEvent(const ADSG_EVENT& e, const Rules& rules, Sink& sink) {
     } else {
         // Open through the NT device path so volumes without drive letters work.
         rec.inspection = Inspect(L"\\\\?\\GLOBALROOT" + ntStream, rules);
+        rec.parentOpenPath = L"\\\\?\\GLOBALROOT" + ntFile;
     }
     WriteEvent(sink, rec, rules, true);
 }
@@ -589,6 +666,7 @@ void ScanFile(const std::filesystem::path& path, const Rules& rules, Sink& sink)
         rec.streamName = name;
         rec.size = static_cast<std::uint64_t>(data.StreamSize.QuadPart);
         rec.inspection = Inspect(open + component, rules);
+        rec.parentOpenPath = open;
         WriteEvent(sink, rec, rules, false);
     } while (FindNextStreamW(find, &data));
     DWORD err = GetLastError();

@@ -7,6 +7,7 @@
   "entropy_min_bytes": 512,
   "stream_size_limit_bytes": 16777216,
   "queue_capacity": 1024,
+  "parent_hash_max_bytes": 8388608,
   "thresholds": { "low": 20, "medium": 40, "high": 70 },
   "weights": {
     "named_stream": 10,

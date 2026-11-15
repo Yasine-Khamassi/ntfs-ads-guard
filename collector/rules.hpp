@@ -18,6 +18,9 @@ struct Rules {
     std::uint64_t entropyMinBytes = 512;
     std::uint64_t sizeLimit = 16 * 1024 * 1024;
     std::size_t queueCapacity = 1024;
+    // Largest host file whose default stream is hashed for a scored event.
+    // 0 turns parent hashing off.
+    std::uint64_t parentHashLimit = 8 * 1024 * 1024;
     int low = 20, medium = 40, high = 70;
     int namedWeight = 10, peWeight = 50, entropyWeight = 25, executableWeight = 20, systemHostWeight = 15;
 };

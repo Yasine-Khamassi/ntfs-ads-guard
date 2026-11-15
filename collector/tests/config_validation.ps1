@@ -31,6 +31,8 @@ $cases = [ordered]@{
     'entropy out of range'      = Mutate { param($o) $o.entropy_threshold = 9 }
     'fractional size limit'     = Mutate { param($o) $o.stream_size_limit_bytes = 10.5 }
     'zero queue capacity'       = Mutate { param($o) $o.queue_capacity = 0 }
+    'negative parent limit'     = Mutate { param($o) $o.parent_hash_max_bytes = -1 }
+    'missing parent limit'      = Mutate { param($o) $o.PSObject.Properties.Remove('parent_hash_max_bytes') }
     'string where number'       = Mutate { param($o) $o.weights.pe_header = '50' }
 }
 
