@@ -56,16 +56,20 @@ jobs:
         # Static Driver Verifier is not shipped in WDKs after build 26017, so
         # it cannot run against the WDK used here. This is the MSBuild
         # equivalent of Driver > Code Analysis in Visual Studio: the compiler
-        # runs with /analyze and the WDK driver rule set, and any warning
-        # fails the build.
+        # runs with /analyze and the WDK's recommended driver rule set (a
+        # superset of the default DriverMinimumRules), and any warning fails
+        # the build.
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
           Import-Module (Join-Path $vs 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
           Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+          $ruleset = Get-ChildItem driver/packages -Recurse -Filter DriverRecommendedRules.ruleset | Select-Object -First 1
+          if (-not $ruleset) { throw 'DriverRecommendedRules.ruleset not found in the WDK package' }
           $props = @('-p:Configuration=Release', '-p:Platform=x64', '-p:RunCodeAnalysis=true',
-                     '-p:CodeAnalysisTreatWarningsAsErrors=true', '-p:SignMode=Off')
+                     '-p:CodeAnalysisTreatWarningsAsErrors=true', '-p:SignMode=Off',
+                     "-p:CodeAnalysisRuleSet=$($ruleset.FullName)")
           Write-Host "Rule set: $(msbuild driver/AdsGuard.vcxproj @props -getProperty:CodeAnalysisRuleSet)"
           msbuild driver/AdsGuard.vcxproj @props -t:Rebuild -nologo -p:IntDir=$env:RUNNER_TEMP\ca\ -p:OutDir=$env:RUNNER_TEMP\ca\out\
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
