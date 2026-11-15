@@ -8,9 +8,15 @@
  *                                 queries are allowed. Emits open, create or
  *                                 overwrite and attaches a stream handle
  *                                 context to handles opened for write.
- *   PreWrite    (<= APC_LEVEL)    looks up the handle context and records the
- *                                 first writer process.
- *   PostWrite   (<= DISPATCH)     only interlocked updates and FltReleaseContext.
+ *   PreWrite    (<= APC_LEVEL)    non-paging: looks up the handle context and
+ *                                 records the first writer process.
+ *                                 paging: skips lazy writer flushes, looks up
+ *                                 the stream context.
+ *   PostWrite   (<= DISPATCH)     interlocked updates, FltReleaseContext and,
+ *                                 for paging writes, queueing one generic
+ *                                 work item per burst.
+ *   PagingWork  (PASSIVE_LEVEL)   sends one paging write event from the name
+ *                                 cached in the stream context.
  *   PreSetInfo  (PASSIVE_LEVEL)   end of file and allocation changes on
  *                                 monitored handles; synchronized so that
  *   PostSetInfo (<= APC_LEVEL)    the post callback runs in the caller's
@@ -19,8 +25,15 @@
  *                                 with the handle open time and the first and
  *                                 last write times.
  *
- * Nothing in the write path queries names or sizes above PASSIVE_LEVEL, so no
- * deferred work items are needed.
+ * Nothing in the write path queries names or sizes above PASSIVE_LEVEL.
+ *
+ * Paging writes (memory-mapped views flushed by the mapped page writer, or by
+ * FlushViewOfFile) have no handle context: they arrive on whatever file object
+ * backs the section, often from a system thread. They are attributed through a
+ * stream context, which Filter Manager keys on the stream itself, so every
+ * file object for the stream finds it. The context holds a copy of the name
+ * taken at the first write-capable open and the process that made the latest
+ * one.
  */
 
 #include <fltKernel.h>
@@ -38,6 +51,18 @@ typedef struct _ADSG_HANDLE_CONTEXT {
     LONGLONG OpenTime;              // FILETIME when PostCreate attached the context
     ACCESS_MASK DesiredAccess;
 } ADSG_HANDLE_CONTEXT, *PADSG_HANDLE_CONTEXT;
+
+typedef struct _ADSG_STREAM_CONTEXT {
+    UNICODE_STRING Name;              // paged copy of the stream path at the first write-capable open
+    SIZE_T FileChars;                 // host file part of Name, in characters
+    ULONG NameFlags;                  // ADSG_FLAG_NAME_OPENED_FORM if Name is the opened form
+    volatile LONG MapperPid;          // last process that opened the stream for write
+    volatile LONG64 MapperCreateTime; // its start time
+    volatile LONG64 PagingBytes;      // paging bytes since the last report
+    volatile LONG64 FirstPagingTime;  // first paging write since the last report
+    volatile LONG64 LastPagingTime;   // latest paging write since the last report
+    volatile LONG WorkQueued;         // 1 while a report work item is queued
+} ADSG_STREAM_CONTEXT, *PADSG_STREAM_CONTEXT;
 
 static struct {
     PFLT_FILTER Filter;
@@ -283,6 +308,131 @@ static VOID FLTAPI HandleContextCleanup(_In_ PFLT_CONTEXT Context, _In_ FLT_CONT
         ObDereferenceObject(ctx->Writer);
 }
 
+static VOID FLTAPI StreamContextCleanup(_In_ PFLT_CONTEXT Context, _In_ FLT_CONTEXT_TYPE ContextType)
+{
+    PADSG_STREAM_CONTEXT ctx = (PADSG_STREAM_CONTEXT)Context;
+    UNREFERENCED_PARAMETER(ContextType);
+    if (ctx->Name.Buffer != NULL)
+        ExFreePoolWithTag(ctx->Name.Buffer, ADSG_TAG);
+}
+
+/* Makes sure the stream carries a stream context and records the opening
+ * process as the one paging writes are attributed to. PASSIVE_LEVEL. */
+static VOID TrackStreamForPaging(_In_ PCFLT_RELATED_OBJECTS FltObjects,
+                                 _In_ PFLT_FILE_NAME_INFORMATION Info, ULONG NameFlags,
+                                 _In_opt_ PEPROCESS Process)
+{
+    PADSG_STREAM_CONTEXT ctx = NULL, existing = NULL;
+    NTSTATUS status;
+
+    PAGED_CODE();
+    if (!FltSupportsStreamContexts(FltObjects->FileObject))
+        return;
+    status = FltGetStreamContext(FltObjects->Instance, FltObjects->FileObject, (PFLT_CONTEXT *)&ctx);
+    if (!NT_SUCCESS(status)) {
+        status = FltAllocateContext(g.Filter, FLT_STREAM_CONTEXT, sizeof(*ctx),
+                                    NonPagedPoolNx, (PFLT_CONTEXT *)&ctx);
+        if (!NT_SUCCESS(status))
+            return;
+        RtlZeroMemory(ctx, sizeof(*ctx));
+        ctx->Name.Buffer = (PWCH)ExAllocatePool2(POOL_FLAG_PAGED, Info->Name.Length, ADSG_TAG);
+        if (ctx->Name.Buffer == NULL) {
+            FltReleaseContext(ctx);
+            return;
+        }
+        RtlCopyMemory(ctx->Name.Buffer, Info->Name.Buffer, Info->Name.Length);
+        ctx->Name.Length = Info->Name.Length;
+        ctx->Name.MaximumLength = Info->Name.Length;
+        ctx->FileChars = HostChars(Info);
+        ctx->NameFlags = NameFlags & ADSG_FLAG_NAME_OPENED_FORM;
+        status = FltSetStreamContext(FltObjects->Instance, FltObjects->FileObject,
+                                     FLT_SET_CONTEXT_KEEP_IF_EXISTS, ctx, (PFLT_CONTEXT *)&existing);
+        if (!NT_SUCCESS(status)) {
+            FltReleaseContext(ctx); /* last reference: frees it and its name */
+            if (status != STATUS_FLT_CONTEXT_ALREADY_DEFINED || existing == NULL)
+                return;
+            ctx = existing; /* another open won the race; already referenced */
+        }
+    }
+    if (Process != NULL) {
+        InterlockedExchange64(&ctx->MapperCreateTime, PsGetProcessCreateTimeQuadPart(Process));
+        InterlockedExchange(&ctx->MapperPid, (LONG)HandleToULong(PsGetProcessId(Process)));
+    }
+    FltReleaseContext(ctx);
+}
+
+/* Reports the paging writes accumulated in a stream context. Runs in a system
+ * worker thread at PASSIVE_LEVEL. Filter Manager keeps the instance from being
+ * torn down until this returns. */
+static VOID FLTAPI PagingWork(_In_ PFLT_GENERIC_WORKITEM WorkItem, _In_ PVOID FltObject, _In_opt_ PVOID Context)
+{
+    PADSG_STREAM_CONTEXT ctx = (PADSG_STREAM_CONTEXT)Context;
+    PEPROCESS process = NULL;
+    ADSG_EVENT_INFO ev;
+
+    UNREFERENCED_PARAMETER(FltObject);
+    PAGED_CODE();
+    if (ctx == NULL) {
+        FltFreeGenericWorkItem(WorkItem);
+        return;
+    }
+    /* Clear the flag first so that writes completing from here on queue a
+     * new report instead of being lost. */
+    InterlockedExchange(&ctx->WorkQueued, 0);
+    RtlZeroMemory(&ev, sizeof(ev));
+    ev.BytesWritten = (ULONGLONG)InterlockedExchange64(&ctx->PagingBytes, 0);
+    ev.FirstWriteTime = InterlockedExchange64(&ctx->FirstPagingTime, 0);
+    ev.LastWriteTime = InterlockedExchange64(&ctx->LastPagingTime, 0);
+    if (ev.BytesWritten != 0) {
+        ev.Operation = AdsGuardWrite;
+        ev.WriteSource = AdsGuardWritePaging;
+        ev.Flags = ctx->NameFlags | ADSG_FLAG_NAME_CACHED;
+        ev.FallbackPid = (ULONG)InterlockedCompareExchange(&ctx->MapperPid, 0, 0);
+        ev.FallbackCreateTime = InterlockedCompareExchange64(&ctx->MapperCreateTime, 0, 0);
+        /* Use the live process for the image path only if the PID still
+         * belongs to the process that opened the stream. */
+        if (ev.FallbackPid != 0 &&
+            NT_SUCCESS(PsLookupProcessByProcessId(ULongToHandle(ev.FallbackPid), &process))) {
+            if (PsGetProcessCreateTimeQuadPart(process) == ev.FallbackCreateTime)
+                ev.Process = process;
+        }
+        SendEvent(NULL, &ctx->Name, ctx->FileChars, &ev);
+        if (process != NULL)
+            ObDereferenceObject(process);
+    }
+    FltReleaseContext(ctx);
+    FltFreeGenericWorkItem(WorkItem);
+}
+
+/* PostWrite part for paging I/O. Runs at <= DISPATCH_LEVEL. */
+static VOID AccountPagingWrite(_In_ PFLT_CALLBACK_DATA Data, _In_ PCFLT_RELATED_OBJECTS FltObjects,
+                               _In_ PADSG_STREAM_CONTEXT Ctx)
+{
+    PFLT_GENERIC_WORKITEM item;
+    LONGLONG now;
+
+    if (!NT_SUCCESS(Data->IoStatus.Status) || Data->IoStatus.Information == 0)
+        return;
+    now = NowFileTime();
+    InterlockedAdd64(&Ctx->PagingBytes, (LONG64)Data->IoStatus.Information);
+    InterlockedCompareExchange64(&Ctx->FirstPagingTime, now, 0);
+    InterlockedExchange64(&Ctx->LastPagingTime, now);
+    if (g.ClientPort == NULL || InterlockedCompareExchange(&Ctx->WorkQueued, 1, 0) != 0)
+        return; /* nobody listening, or a report is already queued and will include these bytes */
+
+    item = FltAllocateGenericWorkItem();
+    if (item != NULL) {
+        FltReferenceContext(Ctx); /* released by PagingWork */
+        if (NT_SUCCESS(FltQueueGenericWorkItem(item, FltObjects->Instance, PagingWork,
+                                               DelayedWorkQueue, Ctx)))
+            return;
+        FltReleaseContext(Ctx);
+        FltFreeGenericWorkItem(item);
+    }
+    InterlockedExchange(&Ctx->WorkQueued, 0);
+    InterlockedIncrement(&g.DroppedEvents);
+}
+
 static FLT_PREOP_CALLBACK_STATUS FLTAPI PreCreate(_Inout_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects, _Outptr_result_maybenull_ PVOID *CompletionContext)
 {
@@ -319,8 +469,10 @@ static FLT_POSTOP_CALLBACK_STATUS FLTAPI PostCreate(_Inout_ PFLT_CALLBACK_DATA D
     }
 
     access = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
-    if (FlagOn(access, FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL | MAXIMUM_ALLOWED))
+    if (FlagOn(access, FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL | MAXIMUM_ALLOWED)) {
         AttachHandleContext(FltObjects, access);
+        TrackStreamForPaging(FltObjects, info, nameFlags, FltGetRequestorProcess(Data));
+    }
 
     RtlZeroMemory(&ev, sizeof(ev));
     switch (Data->IoStatus.Information) {
@@ -340,9 +492,22 @@ static FLT_PREOP_CALLBACK_STATUS FLTAPI PreWrite(_Inout_ PFLT_CALLBACK_DATA Data
     _In_ PCFLT_RELATED_OBJECTS FltObjects, _Outptr_result_maybenull_ PVOID *CompletionContext)
 {
     PADSG_HANDLE_CONTEXT ctx = NULL;
+    PADSG_STREAM_CONTEXT stream = NULL;
     PEPROCESS process;
 
     *CompletionContext = NULL;
+    if (FlagOn(Data->Iopb->IrpFlags, IRP_PAGING_IO)) {
+        /* The lazy writer flushing cached data marks the thread with
+         * FSRTL_CACHE_TOP_LEVEL_IRP. Those bytes were already counted as
+         * non-paging writes on the handle that wrote them. */
+        if (IoGetTopLevelIrp() == (PIRP)FSRTL_CACHE_TOP_LEVEL_IRP)
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        if (!NT_SUCCESS(FltGetStreamContext(FltObjects->Instance, FltObjects->FileObject,
+                                            (PFLT_CONTEXT *)&stream)))
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        *CompletionContext = stream; /* reference released in PostWrite */
+        return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+    }
     if (!NT_SUCCESS(FltGetStreamHandleContext(FltObjects->Instance, FltObjects->FileObject,
                                               (PFLT_CONTEXT *)&ctx)))
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -364,9 +529,16 @@ static FLT_POSTOP_CALLBACK_STATUS FLTAPI PostWrite(_Inout_ PFLT_CALLBACK_DATA Da
 {
     PADSG_HANDLE_CONTEXT ctx = (PADSG_HANDLE_CONTEXT)CompletionContext;
 
-    UNREFERENCED_PARAMETER(FltObjects);
     if (ctx == NULL)
         return FLT_POSTOP_FINISHED_PROCESSING;
+    if (FlagOn(Data->Iopb->IrpFlags, IRP_PAGING_IO)) {
+        /* CompletionContext is a stream context here, see PreWrite. The
+         * stream holds its own reference, so this release is never the last. */
+        if (!FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING))
+            AccountPagingWrite(Data, FltObjects, (PADSG_STREAM_CONTEXT)(PVOID)ctx);
+        FltReleaseContext(ctx);
+        return FLT_POSTOP_FINISHED_PROCESSING;
+    }
     /* May run at DISPATCH_LEVEL: interlocked updates only. The handle still
      * holds its own context reference, so this release is never the last. */
     if (!FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING) &&
@@ -549,12 +721,13 @@ static NTSTATUS FLTAPI FilterUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags)
 
 static const FLT_CONTEXT_REGISTRATION Contexts[] = {
     { FLT_STREAMHANDLE_CONTEXT, 0, HandleContextCleanup, sizeof(ADSG_HANDLE_CONTEXT), ADSG_TAG },
+    { FLT_STREAM_CONTEXT, 0, StreamContextCleanup, sizeof(ADSG_STREAM_CONTEXT), ADSG_TAG },
     { FLT_CONTEXT_END }
 };
 
 static const FLT_OPERATION_REGISTRATION Callbacks[] = {
     { IRP_MJ_CREATE, 0, PreCreate, PostCreate },
-    { IRP_MJ_WRITE, FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO, PreWrite, PostWrite },
+    { IRP_MJ_WRITE, 0, PreWrite, PostWrite },
     { IRP_MJ_SET_INFORMATION, FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO, PreSetInformation, PostSetInformation },
     { IRP_MJ_CLEANUP, 0, PreCleanup, NULL },
     { IRP_MJ_OPERATION_END }

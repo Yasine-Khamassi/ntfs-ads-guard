@@ -45,7 +45,7 @@ typedef enum _ADSG_WRITE_SOURCE {
 #define ADSG_FLAG_IMAGE_TRUNCATED   0x00000008  // ProcessImage was cut to fit
 #define ADSG_FLAG_NAME_OPENED_FORM  0x00000010  // normalized name failed, opened name used
 #define ADSG_FLAG_WRITER_DIFFERS    0x00000020  // handle write: closing process is not the first writer
-#define ADSG_FLAG_NAME_CACHED       0x00000040  // paging write: name cached at the last write-capable open
+#define ADSG_FLAG_NAME_CACHED       0x00000040  // paging write: name cached at the first write-capable open
 
 #pragma pack(push, 8)
 typedef struct _ADSG_EVENT {
